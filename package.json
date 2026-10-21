@@ -1,0 +1,18 @@
+{
+  "name": "expense-tracker",
+  "version": "1.0.0",
+  "description": "Expense Tracker - приложение для учёта расходов и доходов",
+  "scripts": {
+    "install:backend": "cd backend && npm install",
+    "install:frontend": "cd frontend && npm install",
+    "install:all": "npm run install:backend && npm run install:frontend",
+    "init:db": "cd backend && npm run init-db",
+    "start:backend": "cd backend && npm start",
+    "start:frontend": "cd frontend && npm start",
+    "dev:backend": "cd backend && npm run dev",
+    "setup": "npm run install:all && npm run init:db"
+  },
+  "keywords": ["expense", "tracker", "finance", "react", "nodejs"],
+  "author": "",
+  "license": "MIT"
+}

@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const db = require('./database');
+const { initDatabase, getDb, saveDatabase } = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -9,6 +9,42 @@ const PORT = process.env.PORT || 5000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Инициализация базы данных
+let dbReady = false;
+
+initDatabase().then(() => {
+  const db = getDb();
+  
+  // Создание таблицы если не существует
+  db.run(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      amount REAL NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('income', 'expense')),
+      category TEXT NOT NULL,
+      date TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  
+  saveDatabase();
+  dbReady = true;
+  console.log('✅ База данных готова к работе');
+}).catch(err => {
+  console.error('❌ Ошибка инициализации базы данных:', err);
+  process.exit(1);
+});
+
+// Middleware для проверки готовности БД
+app.use((req, res, next) => {
+  if (!dbReady) {
+    return res.status(503).json({ error: 'База данных инициализируется, попробуйте позже' });
+  }
+  next();
+});
 
 // Валидация данных
 const validateTransaction = (data) => {
@@ -42,35 +78,42 @@ const validateTransaction = (data) => {
 // Получить все транзакции с фильтрацией
 app.get('/api/transactions', (req, res) => {
   try {
+    const db = getDb();
     const { type, category, startDate, endDate } = req.query;
     
     let query = 'SELECT * FROM transactions WHERE 1=1';
-    const params = [];
+    const params = {};
     
     if (type) {
-      query += ' AND type = ?';
-      params.push(type);
+      query += ' AND type = $type';
+      params.$type = type;
     }
     
     if (category) {
-      query += ' AND category = ?';
-      params.push(category);
+      query += ' AND category = $category';
+      params.$category = category;
     }
     
     if (startDate) {
-      query += ' AND date >= ?';
-      params.push(startDate);
+      query += ' AND date >= $startDate';
+      params.$startDate = startDate;
     }
     
     if (endDate) {
-      query += ' AND date <= ?';
-      params.push(endDate);
+      query += ' AND date <= $endDate';
+      params.$endDate = endDate;
     }
     
     query += ' ORDER BY date DESC, created_at DESC';
     
     const stmt = db.prepare(query);
-    const transactions = stmt.all(...params);
+    stmt.bind(params);
+    
+    const transactions = [];
+    while (stmt.step()) {
+      transactions.push(stmt.getAsObject());
+    }
+    stmt.free();
     
     res.json(transactions);
   } catch (error) {
@@ -82,15 +125,19 @@ app.get('/api/transactions', (req, res) => {
 // Получить одну транзакцию
 app.get('/api/transactions/:id', (req, res) => {
   try {
+    const db = getDb();
     const { id } = req.params;
-    const stmt = db.prepare('SELECT * FROM transactions WHERE id = ?');
-    const transaction = stmt.get(id);
+    const stmt = db.prepare('SELECT * FROM transactions WHERE id = $id');
+    stmt.bind({ $id: id });
     
-    if (!transaction) {
-      return res.status(404).json({ error: 'Транзакция не найдена' });
+    if (stmt.step()) {
+      const transaction = stmt.getAsObject();
+      stmt.free();
+      res.json(transaction);
+    } else {
+      stmt.free();
+      res.status(404).json({ error: 'Транзакция не найдена' });
     }
-    
-    res.json(transaction);
   } catch (error) {
     console.error('Ошибка при получении транзакции:', error);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -107,15 +154,26 @@ app.post('/api/transactions', (req, res) => {
     }
     
     const { title, amount, type, category, date } = req.body;
+    const db = getDb();
     
-    const stmt = db.prepare(`
+    db.run(`
       INSERT INTO transactions (title, amount, type, category, date)
-      VALUES (?, ?, ?, ?, ?)
-    `);
+      VALUES ($title, $amount, $type, $category, $date)
+    `, {
+      $title: title,
+      $amount: amount,
+      $type: type,
+      $category: category,
+      $date: date
+    });
     
-    const result = stmt.run(title, amount, type, category, date);
+    saveDatabase();
     
-    const newTransaction = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
+    // Получаем последнюю вставленную запись
+    const stmt = db.prepare('SELECT * FROM transactions ORDER BY id DESC LIMIT 1');
+    stmt.step();
+    const newTransaction = stmt.getAsObject();
+    stmt.free();
     
     res.status(201).json(newTransaction);
   } catch (error) {
@@ -136,22 +194,34 @@ app.put('/api/transactions/:id', (req, res) => {
     }
     
     const { title, amount, type, category, date } = req.body;
+    const db = getDb();
     
-    const stmt = db.prepare(`
+    db.run(`
       UPDATE transactions 
-      SET title = ?, amount = ?, type = ?, category = ?, date = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
+      SET title = $title, amount = $amount, type = $type, category = $category, date = $date, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $id
+    `, {
+      $title: title,
+      $amount: amount,
+      $type: type,
+      $category: category,
+      $date: date,
+      $id: id
+    });
     
-    const result = stmt.run(title, amount, type, category, date, id);
+    saveDatabase();
     
-    if (result.changes === 0) {
-      return res.status(404).json({ error: 'Транзакция не найдена' });
+    const stmt = db.prepare('SELECT * FROM transactions WHERE id = $id');
+    stmt.bind({ $id: id });
+    
+    if (stmt.step()) {
+      const updatedTransaction = stmt.getAsObject();
+      stmt.free();
+      res.json(updatedTransaction);
+    } else {
+      stmt.free();
+      res.status(404).json({ error: 'Транзакция не найдена' });
     }
-    
-    const updatedTransaction = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
-    
-    res.json(updatedTransaction);
   } catch (error) {
     console.error('Ошибка при обновлении транзакции:', error);
     res.status(500).json({ error: 'Ошибка сервера при обновлении транзакции' });
@@ -162,13 +232,20 @@ app.put('/api/transactions/:id', (req, res) => {
 app.delete('/api/transactions/:id', (req, res) => {
   try {
     const { id } = req.params;
+    const db = getDb();
     
-    const stmt = db.prepare('DELETE FROM transactions WHERE id = ?');
-    const result = stmt.run(id);
+    // Проверяем существование
+    const checkStmt = db.prepare('SELECT id FROM transactions WHERE id = $id');
+    checkStmt.bind({ $id: id });
+    const exists = checkStmt.step();
+    checkStmt.free();
     
-    if (result.changes === 0) {
+    if (!exists) {
       return res.status(404).json({ error: 'Транзакция не найдена' });
     }
+    
+    db.run('DELETE FROM transactions WHERE id = $id', { $id: id });
+    saveDatabase();
     
     res.json({ message: 'Транзакция успешно удалена' });
   } catch (error) {
@@ -180,25 +257,26 @@ app.delete('/api/transactions/:id', (req, res) => {
 // Получить статистику
 app.get('/api/statistics', (req, res) => {
   try {
+    const db = getDb();
     const { startDate, endDate } = req.query;
     
     let query = 'SELECT type, SUM(amount) as total FROM transactions WHERE 1=1';
-    const params = [];
+    const params = {};
     
     if (startDate) {
-      query += ' AND date >= ?';
-      params.push(startDate);
+      query += ' AND date >= $startDate';
+      params.$startDate = startDate;
     }
     
     if (endDate) {
-      query += ' AND date <= ?';
-      params.push(endDate);
+      query += ' AND date <= $endDate';
+      params.$endDate = endDate;
     }
     
     query += ' GROUP BY type';
     
     const stmt = db.prepare(query);
-    const results = stmt.all(...params);
+    stmt.bind(params);
     
     const stats = {
       income: 0,
@@ -206,13 +284,15 @@ app.get('/api/statistics', (req, res) => {
       balance: 0
     };
     
-    results.forEach(row => {
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
       if (row.type === 'income') {
         stats.income = row.total;
       } else if (row.type === 'expense') {
         stats.expense = row.total;
       }
-    });
+    }
+    stmt.free();
     
     stats.balance = stats.income - stats.expense;
     
@@ -226,30 +306,37 @@ app.get('/api/statistics', (req, res) => {
 // Получить статистику по категориям
 app.get('/api/statistics/categories', (req, res) => {
   try {
+    const db = getDb();
     const { type, startDate, endDate } = req.query;
     
     let query = 'SELECT category, SUM(amount) as total FROM transactions WHERE 1=1';
-    const params = [];
+    const params = {};
     
     if (type) {
-      query += ' AND type = ?';
-      params.push(type);
+      query += ' AND type = $type';
+      params.$type = type;
     }
     
     if (startDate) {
-      query += ' AND date >= ?';
-      params.push(startDate);
+      query += ' AND date >= $startDate';
+      params.$startDate = startDate;
     }
     
     if (endDate) {
-      query += ' AND date <= ?';
-      params.push(endDate);
+      query += ' AND date <= $endDate';
+      params.$endDate = endDate;
     }
     
     query += ' GROUP BY category ORDER BY total DESC';
     
     const stmt = db.prepare(query);
-    const results = stmt.all(...params);
+    stmt.bind(params);
+    
+    const results = [];
+    while (stmt.step()) {
+      results.push(stmt.getAsObject());
+    }
+    stmt.free();
     
     res.json(results);
   } catch (error) {
@@ -261,8 +348,15 @@ app.get('/api/statistics/categories', (req, res) => {
 // Получить список категорий
 app.get('/api/categories', (req, res) => {
   try {
+    const db = getDb();
     const stmt = db.prepare('SELECT DISTINCT category FROM transactions ORDER BY category');
-    const categories = stmt.all().map(row => row.category);
+    
+    const categories = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      categories.push(row.category);
+    }
+    stmt.free();
     
     res.json(categories);
   } catch (error) {
